@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/google/go-querystring/query"
 )
@@ -24,11 +25,17 @@ type service struct {
 
 // Config represents the configuration for a PagerDuty client
 type Config struct {
-	BaseURL    string
-	HTTPClient *http.Client
-	Token      string
-	UserAgent  string
-	Debug      bool
+	BaseURL                string
+	HTTPClient             *http.Client
+	Token                  string
+	UserAgent              string
+	Debug                  bool
+	ClientID               string
+	ClientSecret           string
+	PDSubDomain            string
+	Region                 string // For use in the future with Scoped Oauth
+	UseScopedOauth         bool
+	scopedOauthAccessToken string
 }
 
 // Client manages the communication with the PagerDuty API
@@ -184,13 +191,78 @@ func (c *Client) newRequestContext(ctx context.Context, method, url string, body
 		}
 	}
 	req.Header.Add("Accept", "application/vnd.pagerduty+json;version=2")
-	req.Header.Add("Authorization", fmt.Sprintf("Token token=%s", c.Config.Token))
 	req.Header.Add("Content-Type", "application/json")
+
+	authzHeader := fmt.Sprintf("Token token=%s", c.Config.Token)
+	if c.Config.UseScopedOauth {
+		log.Printf("[INFO] Pagerduty - Using Scoped Oauth")
+		authzHeader = fmt.Sprintf("Bearer %s", c.Config.scopedOauthAccessToken)
+	}
+	req.Header.Add("Authorization", authzHeader)
 
 	if c.Config.UserAgent != "" {
 		req.Header.Add("User-Agent", c.Config.UserAgent)
 	}
 	return req, nil
+}
+
+type scopedOauthResponse struct {
+	AccessToken string `json:"access_token"`
+	Scope       string `json:"scope"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+func (c *Client) generateScopedOauthAccessToken() error {
+	clientID := c.Config.ClientID
+	secret := c.Config.ClientSecret
+	subdomain := c.Config.PDSubDomain
+	region := "us" // In future this value has to be available through c.Config.Region
+	u := "https://identity.pagerduty.com/oauth/token"
+	scopes := "incidents.read services.read"
+
+	data := url.Values{}
+	data.Add("grant_type", "client_credentials")
+	data.Add("client_id", clientID)
+	data.Add("client_secret", secret)
+	data.Add("scope", fmt.Sprintf("as_account-%s.%s %s", region, subdomain, scopes))
+	encodedData := data.Encode()
+	log.Printf("[DEBUG] Encoded data sent to identity.pagerduty.com %q", encodedData)
+	req, err := http.NewRequest("POST", u, strings.NewReader(encodedData))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Add("Accept", "application/vnd.pagerduty+json;version=2")
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("User-Agent", c.Config.UserAgent)
+
+	internalClient := &http.Client{}
+
+	v := new(scopedOauthResponse)
+	resp, err := internalClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode > 400 {
+		return fmt.Errorf("with status code %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	json.Unmarshal(bodyBytes, v)
+	if err != nil {
+		return err
+	}
+
+	c.Config.scopedOauthAccessToken = v.AccessToken
+
+	return nil
 }
 
 func (c *Client) newRequestDo(method, url string, qryOptions, body, v interface{}) (*Response, error) {
@@ -212,7 +284,16 @@ func (c *Client) newRequestDoContext(ctx context.Context, method, url string, qr
 	if err != nil {
 		return nil, err
 	}
-	return c.do(req, v)
+	resp, err := c.do(req, v)
+	if err != nil {
+		if respErr, ok := err.(*Error); ok && respErr.needToRetry {
+			return c.newRequestDoContext(ctx, method, url, qryOptions, body, v)
+		}
+
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 func (c *Client) newRequestDoOptions(method, url string, qryOptions, body, v interface{}, reqOptions ...RequestOptions) (*Response, error) {
@@ -425,6 +506,16 @@ func (c *Client) decodeErrorResponse(res *Response) error {
 	v := &errorResponse{Error: &Error{ErrorResponse: res}}
 	if err := c.DecodeJSON(res, v); err != nil {
 		return fmt.Errorf("%s API call to %s failed: %v", res.Response.Request.Method, res.Response.Request.URL.String(), res.Response.Status)
+	}
+	if c.Config.UseScopedOauth && res.Response.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%s API call to %s failed because %s API scope is required", res.Response.Request.Method, res.Response.Request.URL.String(), v.Error.RequiredScopes)
+	}
+	if c.Config.UseScopedOauth && res.Response.StatusCode == http.StatusUnauthorized {
+		err := c.generateScopedOauthAccessToken()
+		if err != nil {
+			return fmt.Errorf("API call to obtain a new Scoped Oauth Access Token failed: %v", err)
+		}
+		v.Error.needToRetry = true
 	}
 
 	return v.Error
