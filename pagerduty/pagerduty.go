@@ -213,27 +213,56 @@ type scopedOauthResponse struct {
 	ExpiresIn   int    `json:"expires_in"`
 }
 
+func availableOauthScopes() []string {
+	return []string{
+		"abilities.read",
+		"addons.read",
+		"addons.write",
+		"audit_records.read",
+		"incidents.read",
+		"change_events.read",
+		"change_events.write",
+		"event_orchestrations.read",
+		"event_orchestrations.write",
+		"event_rules.read",
+		"event_rules.write",
+		"extension_schemas.read",
+		"licenses.read",
+		"services.read",
+		"services.write",
+		"teams.read",
+		"teams.write",
+		"users.read",
+		"users.write",
+		"users:contact_methods.read",
+		"users:sessions.read",
+		"users:sessions.write",
+		"vendors.read",
+		"webhook_subscriptions.read",
+		"webhook_subscriptions.write",
+	}
+}
+
 func (c *Client) generateScopedOauthAccessToken() error {
-	clientID := c.Config.ClientID
-	secret := c.Config.ClientSecret
-	subdomain := c.Config.PDSubDomain
 	region := "us" // In future this value has to be available through c.Config.Region
+	subdomain := c.Config.PDSubDomain
 	u := "https://identity.pagerduty.com/oauth/token"
-	scopes := "incidents.read services.read"
+	scopes := strings.Join(availableOauthScopes(), " ")
 
 	data := url.Values{}
 	data.Add("grant_type", "client_credentials")
-	data.Add("client_id", clientID)
-	data.Add("client_secret", secret)
+	data.Add("client_id", c.Config.ClientID)
+	data.Add("client_secret", c.Config.ClientSecret)
 	data.Add("scope", fmt.Sprintf("as_account-%s.%s %s", region, subdomain, scopes))
 	encodedData := data.Encode()
-	log.Printf("[DEBUG] Encoded data sent to identity.pagerduty.com %q", encodedData)
-	req, err := http.NewRequest("POST", u, strings.NewReader(encodedData))
+	payload := strings.NewReader(encodedData)
+
+	// log.Printf("[DEBUG] Encoded data sent to identity.pagerduty.com %q", payload)
+	req, err := http.NewRequest("POST", u, payload)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Add("Accept", "application/vnd.pagerduty+json;version=2")
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Add("User-Agent", c.Config.UserAgent)
 
@@ -261,6 +290,7 @@ func (c *Client) generateScopedOauthAccessToken() error {
 	}
 
 	c.Config.scopedOauthAccessToken = v.AccessToken
+	log.Printf("[DEBUG] access_token %s", v.AccessToken)
 
 	return nil
 }
@@ -316,7 +346,16 @@ func (c *Client) newRequestDoOptionsContext(ctx context.Context, method, url str
 		return nil, err
 	}
 
-	return c.do(req, v)
+	resp, err := c.do(req, v)
+	if err != nil {
+		if respErr, ok := err.(*Error); ok && respErr.needToRetry {
+			return c.newRequestDoOptionsContext(ctx, method, url, qryOptions, body, v)
+		}
+
+		return nil, err
+	}
+
+	return resp, nil
 }
 
 func (c *Client) do(req *http.Request, v interface{}) (*Response, error) {
@@ -504,19 +543,24 @@ func (c *Client) checkResponse(res *Response) error {
 func (c *Client) decodeErrorResponse(res *Response) error {
 	// Try to decode error response or fallback with standard error
 	v := &errorResponse{Error: &Error{ErrorResponse: res}}
-	if err := c.DecodeJSON(res, v); err != nil {
-		return fmt.Errorf("%s API call to %s failed: %v", res.Response.Request.Method, res.Response.Request.URL.String(), res.Response.Status)
-	}
-	if c.Config.UseScopedOauth && res.Response.StatusCode == http.StatusForbidden {
+	err := c.DecodeJSON(res, v)
+	isOauthScopeMissing := c.Config.UseScopedOauth && res.Response.StatusCode == http.StatusForbidden
+	needNewOauthScopedAccessToken := c.Config.UseScopedOauth && res.Response.StatusCode == http.StatusUnauthorized
+	if isOauthScopeMissing {
 		return fmt.Errorf("%s API call to %s failed because %s API scope is required", res.Response.Request.Method, res.Response.Request.URL.String(), v.Error.RequiredScopes)
 	}
-	if c.Config.UseScopedOauth && res.Response.StatusCode == http.StatusUnauthorized {
+	if needNewOauthScopedAccessToken {
 		err := c.generateScopedOauthAccessToken()
 		if err != nil {
 			return fmt.Errorf("API call to obtain a new Scoped Oauth Access Token failed: %v", err)
 		}
 		v.Error.needToRetry = true
+		return v.Error
 	}
+	if err != nil {
+		return fmt.Errorf("%s API call to %s failed: %v", res.Response.Request.Method, res.Response.Request.URL.String(), res.Response.Status)
+	}
+	log.Printf("[INFO] v.Error %+v", v.Error)
 
 	return v.Error
 }
