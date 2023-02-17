@@ -68,6 +68,7 @@ type Client struct {
 	CustomFields                 *CustomFieldService
 	CustomFieldSchemas           *CustomFieldSchemaService
 	CustomFieldSchemaAssignments *CustomFieldSchemaAssignmentService
+	Licenses                     *LicenseService
 }
 
 // Response is a wrapper around http.Response
@@ -138,6 +139,7 @@ func NewClient(config *Config) (*Client, error) {
 	c.CustomFields = &CustomFieldService{c}
 	c.CustomFieldSchemas = &CustomFieldSchemaService{c}
 	c.CustomFieldSchemaAssignments = &CustomFieldSchemaAssignmentService{c}
+	c.Licenses = &LicenseService{c}
 
 	InitCache(c)
 	PopulateCache()

@@ -46,6 +46,7 @@ type User struct {
 	Teams             []*TeamReference          `json:"teams,omitempty"`
 	TimeZone          string                    `json:"time_zone,omitempty"`
 	Type              string                    `json:"type,omitempty"`
+	License           *LicenseReference         `json:"license,omitempty"`
 }
 
 // UserPayload represents a user.

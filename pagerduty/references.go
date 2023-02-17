@@ -62,3 +62,6 @@ type IncidentAttributeReference resourceReference
 // CustomFieldSchemaReference represents a reference to a Custom
 // Field schema
 type CustomFieldSchemaReference resourceReference
+
+// LicenseReference represents a reference to a License
+type LicenseReference resourceReference
